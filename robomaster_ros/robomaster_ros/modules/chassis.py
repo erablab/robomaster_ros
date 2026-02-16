@@ -33,6 +33,8 @@ DEFAULT_TWIST_ERROR_LINEAR = 0.005
 DEFAULT_TWIST_ERROR_ANGULAR_XY = 0.01
 DEFAULT_TWIST_ERROR_ANGULAR_Z = 0.03
 DEFAULT_ACCELERATION_ERROR = 0.1
+MAX_LINEAR_SPEED = 0.1 # m/s
+MAX_ANGULAR_SPEED = 1.0 # rad/s
 
 
 # rmp -> [linear] speed
@@ -354,6 +356,9 @@ class Chassis(Module):
             self.api.unsub_status()
 
     def has_received_twist(self, msg: geometry_msgs.msg.Twist) -> None:
+        msg.linear.x = min(max(msg.linear.x, -MAX_LINEAR_SPEED), MAX_LINEAR_SPEED)
+        msg.linear.y = min(max(msg.linear.y, -MAX_LINEAR_SPEED), MAX_LINEAR_SPEED)
+        msg.angular.z = min(max(msg.angular.z, -MAX_ANGULAR_SPEED), MAX_ANGULAR_SPEED)
         if self.twist_to_wheel_speeds:
             front_left, front_right, rear_left, rear_right = wheel_speeds_from_twist(
                 msg.linear.x, msg.linear.y, msg.angular.z)
