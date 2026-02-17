@@ -35,7 +35,7 @@ RUN python3 -m pip install git+https://github.com/erablab/RoboMaster-SDK.git@c47
 
 RUN mkdir -p /ros_ws/src \
     && cd /ros_ws \
-    && git clone https://github.com/erablab/robomaster_ros.git src/robomaster_ros && cd src/robomaster_ros && git checkout 6ca19078913d6a1b21dd3e4d798743d7d6191a89 && cd /ros_ws \
+    && git clone https://github.com/erablab/robomaster_ros.git src/robomaster_ros \
     && source /ros_entrypoint.sh \
     && colcon build --install-base /opt/ros/ws --merge-install \
     && rm -r /ros_ws
