@@ -83,6 +83,14 @@ def wheel_speeds_from_twist(vx: float, vy: float, vtheta: float,
     return (front_left, front_right, rear_left, rear_right)
 
 
+def twist_from_wheel_speeds(front_left: float, front_right: float, rear_left: float, rear_right: float,
+                            axis_length: float = AXIS) -> Tuple[float, float, float]:
+    vx = (front_left + front_right + rear_left + rear_right) * 0.25
+    vy = (-front_left + front_right + rear_left - rear_right) * 0.25
+    vtheta = (-front_left + front_right - rear_left + rear_right) * 0.25 / axis_length
+    return (vx, vy, vtheta)
+
+
 WHEEL_FRAMES = ['front_right_wheel_joint', 'front_left_wheel_joint',
                 'rear_left_wheel_joint', 'rear_right_wheel_joint']
 
@@ -371,9 +379,16 @@ class Chassis(Module):
                 x=msg.linear.x, y=-msg.linear.y, z=-deg(msg.angular.z), timeout=self.timeout)
 
     def has_received_wheel_speeds(self, msg: robomaster_msgs.msg.WheelSpeeds) -> None:
+        vx, vy, vtheta = twist_from_wheel_speeds(
+            msg.front_left, msg.front_right, msg.rear_left, msg.rear_right)
+        vx = min(max(vx, -MAX_LINEAR_SPEED), MAX_LINEAR_SPEED)
+        vy = min(max(vy, -MAX_LINEAR_SPEED), MAX_LINEAR_SPEED)
+        vtheta = min(max(vtheta, -MAX_ANGULAR_SPEED), MAX_ANGULAR_SPEED)
+        front_left, front_right, rear_left, rear_right = wheel_speeds_from_twist(
+                vx, vy, vtheta)
         self.api.drive_wheels(
-            w1=rpm_from_linear_speed(msg.front_right), w2=rpm_from_linear_speed(msg.front_left),
-            w3=rpm_from_linear_speed(msg.rear_left), w4=rpm_from_linear_speed(msg.rear_right),
+            w1=rpm_from_linear_speed(front_right), w2=rpm_from_linear_speed(front_left),
+            w3=rpm_from_linear_speed(rear_left), w4=rpm_from_linear_speed(rear_right),
             timeout=self.timeout)
 
     def updated_position(self, msg: Tuple[float, float, float]) -> None:
