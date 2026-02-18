@@ -37,7 +37,6 @@ RUN mkdir -p /ros_ws/src \
     && cd /ros_ws \
     && git clone https://github.com/erablab/robomaster_ros.git src/robomaster_ros \
     && source /ros_entrypoint.sh \
-    && colcon build --install-base /opt/ros/ws --merge-install \
-    && rm -r /ros_ws
+    && colcon build --install-base /opt/ros/ws --merge-install
 
 RUN apt-get update && apt-get install -y screen vim iputils-ping net-tools
