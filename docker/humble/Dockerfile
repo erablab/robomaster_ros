@@ -39,4 +39,5 @@ RUN mkdir -p /ros_ws/src \
     && source /ros_entrypoint.sh \
     && colcon build --install-base /opt/ros/ws --merge-install
 
+RUN python3 -m pip install --force-reinstall numpy==1.26.4
 RUN apt-get update && apt-get install -y screen vim iputils-ping net-tools
