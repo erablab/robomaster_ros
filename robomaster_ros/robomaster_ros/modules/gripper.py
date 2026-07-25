@@ -1,10 +1,13 @@
 import time
 import enum
 import threading
+import random
+import math
 
 import numpy as np
 
 import rclpy.action
+import rclpy.callback_groups
 import rclpy.qos
 import rclpy.duration
 import rclpy.time
@@ -16,6 +19,7 @@ import robomaster.protocol
 import robomaster.util
 
 import robomaster_msgs.msg
+import robomaster_msgs.action
 import sensor_msgs.msg
 
 from typing import Any, TYPE_CHECKING, Optional
@@ -73,33 +77,68 @@ _joint_data: np.ndarray = np.array([
     [-0.022499, 0.679722, -1.739244, -0.018727, 1.069579, -0.916939, -0.303067, -0.694846, 1.761261, -0.003472, -1.055300, 0.893363, 0.295063],
     [-0.022918, 0.687846, -1.764646, -0.019682, 1.088293, -0.933733, -0.306504, -0.703549, 1.786527, -0.003254, -1.072585, 0.908795, 0.298343]]).T
 
-class GripperState(enum.Enum):
+class GripperState(enum.IntEnum):
     PAUSED = 0
     OPEN = 1
     CLOSE = 2
 
+
+_UNKNOWN_GRIPPER_STATE = -1
+_VALID_GRIPPER_STATES = {state.value for state in GripperState}
+_VALID_STATUS_RATES = {1, 5, 10, 20, 50}
+
+
 def gripper_data_info(self: robomaster.gripper.GripperSubject) -> int:
+    """Return the raw status value published by the RoboMaster SDK."""
     return self._status
+
 
 robomaster.gripper.GripperSubject.data_info = gripper_data_info
 
+
 class Gripper(Module):
+    """ROS 2 gripper module with a persistent SDK status subscription.
+
+    Important design choices:
+      * Keep one low-rate status subscription for the lifetime of the module.
+      * Serialize all synchronous RoboMaster SDK calls.
+      * Reserve at most one action goal at a time.
+      * Use monotonic wall time for deadlines.
+      * Release goal state from a ``finally`` block so one exception cannot
+        permanently disable the action server.
+    """
 
     _gripper_state: int
 
-    def __init__(self, robot: robomaster.robot.Robot, node: 'RoboMasterROS') -> None:
+    def __init__(self, robot: robomaster.robot.Robot,
+                 node: 'RoboMasterROS') -> None:
         self.gripper = robot.gripper
-        _open: bool = node.declare_parameter('gripper.open', False).value
-        
         self.node = node
         self.logger = node.get_logger()
         self.clock = node.get_clock()
-        
-        if _open:
-            try:
-                self.gripper.open()
-            except Exception as e:
-                self.logger.warning(f"Initial gripper open failed (network drop?): {e}")
+
+        open_on_start: bool = node.declare_parameter(
+            'gripper.open', False).value
+        self._status_rate = int(node.declare_parameter(
+            'gripper.status_rate', 5).value)
+        self._action_timeout = float(node.declare_parameter(
+            'gripper.action_timeout', 5.0).value)
+        self._initial_state_timeout = float(node.declare_parameter(
+            'gripper.initial_state_timeout', 2.0).value)
+        self._status_stale_timeout = float(node.declare_parameter(
+            'gripper.status_stale_timeout', 2.5).value)
+        self._command_retries = max(0, int(node.declare_parameter(
+            'gripper.command_retries', 2).value))
+        self._retry_backoff = max(0.0, float(node.declare_parameter(
+            'gripper.retry_backoff', 0.08).value))
+        self._command_jitter = max(0.0, float(node.declare_parameter(
+            'gripper.command_jitter', 0.05).value))
+
+        if self._status_rate not in _VALID_STATUS_RATES:
+            self.logger.warning(
+                f'Unsupported gripper.status_rate={self._status_rate}; '
+                'using 5 Hz')
+            self._status_rate = 5
 
         self.msg = sensor_msgs.msg.JointState()
         self.msg.name = (
@@ -109,185 +148,495 @@ class Gripper(Module):
 
         n = _joint_data.shape[-1]
         self._xs = np.linspace(0, 1, n)
-        
+
         qos = rclpy.qos.QoSProfile(
             depth=1,
             history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST,
             durability=rclpy.qos.QoSDurabilityPolicy.TRANSIENT_LOCAL)
-            
-        self.gripper_pub = node.create_publisher(robomaster_msgs.msg.GripperState, 'gripper', qos)
-        
-        self._gripper_state = -1
+        self.gripper_pub = node.create_publisher(
+            robomaster_msgs.msg.GripperState, 'gripper', qos)
+
+        # RoboMaster SDK methods such as open(), close(), pause(),
+        # sub_status(), and unsub_status() all perform synchronous protocol
+        # transactions. Do not allow them to overlap.
+        self._sdk_lock = threading.Lock()
+
+        self._state_condition = threading.Condition()
+        self._gripper_state = _UNKNOWN_GRIPPER_STATE
+        self._last_status_monotonic = 0.0
+        self._status_subscription_started_monotonic = 0.0
+        self._status_subscribed = False
+
+        self._goal_mutex = threading.Lock()
+        self._goal_reserved = False
+        self._active_goal_handle: Optional[Any] = None
+        self._cancel_event = threading.Event()
+        self._shutdown_event = threading.Event()
+        self._goal_done_event = threading.Event()
+        self._goal_done_event.set()
+
+        # Store the callback group as an instance member. ROS 2 callback
+        # groups must remain alive for as long as their entities use them.
+        self._gripper_callback_group = (
+            rclpy.callback_groups.ReentrantCallbackGroup())
+
+        # Subscribe before any open/close command. This removes the race in
+        # which the gripper reaches its target before status monitoring starts.
+        self._start_status_subscription()
         self.query_gripper_state()
-        
-        self.should_abort = False
-        self._gripper_action_lock = threading.Lock()
-        
-        # Switched to Reentrant to allow cancel requests to interrupt execution loops
-        cbg = rclpy.callback_groups.ReentrantCallbackGroup()
-        
+
+        if open_on_start:
+            if not self._send_sdk_command(GripperState.OPEN.value, 0.5):
+                self.logger.warning('Initial gripper open command failed')
+
         self._gripper_action_server = rclpy.action.ActionServer(
-            node, robomaster_msgs.action.GripperControl, 'gripper', self.execute_gripper_callback,
+            node,
+            robomaster_msgs.action.GripperControl,
+            'gripper',
+            self.execute_gripper_callback,
             goal_callback=self.new_gripper_goal_callback,
-            cancel_callback=self.cancel_gripper_callback, callback_group=cbg)
+            cancel_callback=self.cancel_gripper_callback,
+            callback_group=self._gripper_callback_group)
+
+    # ------------------------------------------------------------------
+    # Lifecycle and state publication
+    # ------------------------------------------------------------------
 
     def stop(self) -> None:
-        if self.node.connected:
-            pass
+        self._shutdown_event.set()
+        self.abort()
+
+        # Best effort: do not leave a motor actively driving during shutdown.
+        if getattr(self.node, 'connected', False):
+            self._send_sdk_command(
+                GripperState.PAUSED.value, 0.0, retries=0, jitter=False)
+
+        self._stop_status_subscription()
         self._gripper_action_server.destroy()
 
     def abort(self) -> None:
-        if self._gripper_action_lock.locked():
-            self.should_abort = True
-            timeout = time.time() + 2.0  # Prevent infinite lock waiting
-            while self._gripper_action_lock.locked() and time.time() < timeout:
-                self.logger.info("waiting for the action to terminate...")
-                time.sleep(0.1)
+        with self._goal_mutex:
+            active = self._goal_reserved
+            if active:
+                self._cancel_event.set()
+
+        with self._state_condition:
+            self._state_condition.notify_all()
+
+        if active:
+            # Bounded wait only; never block node shutdown indefinitely.
+            self._goal_done_event.wait(timeout=2.0)
 
     def joint_state(self, value: float) -> sensor_msgs.msg.JointState:
-        self.msg.position = [np.interp(value, self._xs, data) for data in _joint_data]
+        self.msg.position = [
+            np.interp(value, self._xs, data) for data in _joint_data]
         return self.msg
-
-    def execute_gripper_callback(self, goal_handle: Any) -> robomaster_msgs.action.GripperControl.Result:
-        if self._gripper_action_lock.locked():
-            goal_handle.abort()
-            return robomaster_msgs.action.GripperControl.Result()
-            
-        request = goal_handle.request
-
-        if request.target_state == self.gripper_state:
-            goal_handle.succeed()
-            self.logger.info('No need to move gripper')
-            return robomaster_msgs.action.GripperControl.Result()
-            
-        self._gripper_action_lock.acquire()
-        self.logger.info(f'Start moving gripper with request {request}')
-        feedback_msg = robomaster_msgs.action.GripperControl.Feedback()
-        self.should_abort = False
-        
-        proto = robomaster.protocol.ProtoGripperCtrl()
-        proto._control = request.target_state
-        proto._power = robomaster.util.GRIPPER_POWER_CHECK.val2proto(100 * request.power)
-
-        try:
-            # Wrap SDK call in try/except. Network failure here would crash the Action thread.
-            self.gripper._send_sync_proto(proto, robomaster.protocol.host2byte(3, 6))
-        except Exception as e:
-            self.logger.error(f'Failed sending ProtoGripperCtrl (Dropped Packet?): {e}')
-            self._gripper_action_lock.release()
-            goal_handle.abort()
-            return robomaster_msgs.action.GripperControl.Result()
-
-        first: Optional[rclpy.time.Time] = None
-        last: Optional[rclpy.time.Time] = None
-        current_state: Optional[int] = None
-
-        def cb(msg: int) -> None:
-            nonlocal first, last, current_state
-            last = self.clock.now()
-            if not first:
-                first = last
-            current_state = msg
-            feedback_msg.current_state = msg
-            goal_handle.publish_feedback(feedback_msg)
-            self.gripper_state = msg
-
-        try:
-            self.gripper.sub_status(freq=20, callback=cb)
-        except Exception as e:
-            self.logger.warning(f"Could not sub_status: {e}")
-
-        # Reduced deadline to 3 seconds. The gripper physically operates very fast. 
-        # A 7s wait while packets are dropping causes massive latency cascades.
-        deadline = self.clock.now() + rclpy.duration.Duration(seconds=15)
-        
-        while (current_state != request.target_state and not self.should_abort and
-               not goal_handle.is_cancel_requested):
-            if (self.clock.now() > deadline):
-                self.logger.warning(
-                    f'Deadline to reach gripper target state {request.target_state} elapsed. '
-                    f'Assuming packet loss or hardware jam.')
-                break
-            time.sleep(0.05)
-
-        try:
-            self.gripper.unsub_status()
-        except AttributeError:
-            pass
-            
-        if last and first:
-            duration = last - first
-        else:
-            self.logger.warn('Got no state messages from gripper during execution')
-            duration = rclpy.duration.Duration()
-            
-        if goal_handle.is_cancel_requested:
-            self.logger.warn('Canceled gripping')
-            goal_handle.canceled()
-        elif self.should_abort or (current_state is not None and feedback_msg.current_state != request.target_state):
-            goal_handle.abort()
-            self.logger.warn(f'Failed moving gripper state: current state '
-                             f'[{self.gripper_state}] != target state [{request.target_state}]')
-        else:
-            goal_handle.succeed()
-            self.logger.info(f'Done moving gripper after {duration.nanoseconds / 1e6:.0f} ms')
-            
-        self._gripper_action_lock.release()
-        return robomaster_msgs.action.GripperControl.Result(duration=duration.to_msg())
-
-    def new_gripper_goal_callback(self, goal_request: robomaster_msgs.action.GripperControl.Goal) -> rclpy.action.server.GoalResponse:
-        if self._gripper_action_lock.locked():
-            return rclpy.action.server.GoalResponse.REJECT
-        return rclpy.action.server.GoalResponse.ACCEPT
-
-    def cancel_gripper_callback(self, goal_handle: Any) -> rclpy.action.CancelResponse:
-        self.logger.info('Canceling gripper action requested')
-        self.should_abort = True
-        try:
-            self.gripper.pause()
-        except Exception as e:
-            self.logger.warning(f"Failed to send pause on cancel: {e}")
-        # Completely removed the `time.sleep(5.0)` that was causing thread deadlocks
-        return rclpy.action.CancelResponse.ACCEPT
 
     @property
     def gripper_state(self) -> int:
-        return self._gripper_state
+        with self._state_condition:
+            return self._gripper_state
 
     @gripper_state.setter
     def gripper_state(self, value: int) -> None:
-        if value != self._gripper_state:
+        self._update_gripper_state(value)
+
+    def _update_gripper_state(self, value: int) -> None:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            self.logger.warning(f'Ignoring invalid gripper state: {value!r}')
+            return
+
+        if value not in _VALID_GRIPPER_STATES:
+            self.logger.warning(f'Ignoring unknown gripper state: {value}')
+            return
+
+        with self._state_condition:
+            changed = value != self._gripper_state
             self._gripper_state = value
+            self._last_status_monotonic = time.monotonic()
+            self._state_condition.notify_all()
+
+        if not changed:
+            return
+
+        # The SDK invokes this method from its receive thread. Never let a ROS
+        # publication exception escape and kill that receive callback path.
+        try:
             msg = robomaster_msgs.msg.GripperState(state=value)
             msg.header.stamp = self.clock.now().to_msg()
             self.gripper_pub.publish(msg)
-            if (value == robomaster_msgs.msg.GripperState.OPEN):
-                self.node.joint_state_pub.publish(self.joint_state(0))
-            if (value == robomaster_msgs.msg.GripperState.CLOSE):
-                self.node.joint_state_pub.publish(self.joint_state(1))
+
+            if value == robomaster_msgs.msg.GripperState.OPEN:
+                self.node.joint_state_pub.publish(self.joint_state(0.0))
+            elif value == robomaster_msgs.msg.GripperState.CLOSE:
+                self.node.joint_state_pub.publish(self.joint_state(1.0))
+        except Exception as exc:
+            self.logger.error(
+                f'Failed publishing gripper state {value}: {exc}')
+
+    def _status_callback(self, msg: int) -> None:
+        try:
+            self._update_gripper_state(msg)
+        except Exception as exc:
+            # This callback runs in the SDK receive thread. It must never throw.
+            self.logger.error(f'Unhandled gripper status callback error: {exc}')
+
+    # ------------------------------------------------------------------
+    # Persistent RoboMaster status subscription
+    # ------------------------------------------------------------------
+
+    def _start_status_subscription(self) -> bool:
+        if self._shutdown_event.is_set():
+            return False
+
+        for attempt in range(self._command_retries + 1):
+            try:
+                with self._sdk_lock:
+                    ok = bool(self.gripper.sub_status(
+                        freq=self._status_rate,
+                        callback=self._status_callback))
+            except Exception as exc:
+                ok = False
+                self.logger.warning(
+                    f'Gripper status subscription attempt {attempt + 1} '
+                    f'raised: {exc}')
+
+            if ok:
+                self._status_subscribed = True
+                self._status_subscription_started_monotonic = time.monotonic()
+                return True
+
+            self.logger.warning(
+                f'Gripper status subscription attempt {attempt + 1} failed')
+            self._retry_sleep(attempt)
+
+        self._status_subscribed = False
+        return False
+
+    def _stop_status_subscription(self) -> bool:
+        if not self._status_subscribed:
+            return True
+
+        try:
+            with self._sdk_lock:
+                ok = bool(self.gripper.unsub_status())
+        except Exception as exc:
+            self.logger.warning(
+                f'Failed to unsubscribe from gripper status: {exc}')
+            ok = False
+
+        self._status_subscribed = False
+        self._status_subscription_started_monotonic = 0.0
+        return ok
+
+    def _status_is_stale(self) -> bool:
+        now = time.monotonic()
+        with self._state_condition:
+            last = self._last_status_monotonic
+            started = self._status_subscription_started_monotonic
+
+        # Allow a newly-created subscription time to deliver its first sample.
+        if last <= 0.0:
+            return started <= 0.0 or (
+                now - started > self._status_stale_timeout)
+        return now - last > self._status_stale_timeout
+
+    def _ensure_status_subscription(self) -> bool:
+        if self._status_subscribed and not self._status_is_stale():
+            return True
+
+        if self._status_subscribed:
+            self.logger.warning(
+                'Gripper status stream is stale; restarting subscription')
+            self._stop_status_subscription()
+
+        return self._start_status_subscription()
 
     def query_gripper_state(self) -> None:
-        self._gripper_state = -1
+        if not self._ensure_status_subscription():
+            self.logger.warning(
+                'Initial gripper status subscription is unavailable')
+            return
 
-        def cb(msg: int) -> None:
-            self.gripper_state = msg
-            
-        try:
-            self.gripper.sub_status(freq=10, callback=cb)
-        except Exception as e:
-            self.logger.error(f"Failed to subscribe to initial gripper status: {e}")
+        deadline = time.monotonic() + self._initial_state_timeout
+        with self._state_condition:
+            while self._gripper_state == _UNKNOWN_GRIPPER_STATE:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    self.logger.warning(
+                        'Timed out querying initial gripper state; '
+                        'keeping state as unknown')
+                    return
+                self._state_condition.wait(timeout=min(0.1, remaining))
 
-        # FIX: Added a strict 2-second timeout. If the first packet drops, 
-        # it will no longer freeze node startup forever.
-        start_time = time.time()
-        while self._gripper_state == -1:
-            if time.time() - start_time > 2.0:
-                self.logger.warning("Timeout querying initial gripper state. Proceeding anyway.")
-                self._gripper_state = GripperState.PAUSED.value
-                break
-            time.sleep(0.01)
-            
+    # ------------------------------------------------------------------
+    # SDK command handling
+    # ------------------------------------------------------------------
+
+    def _retry_sleep(self, attempt: int) -> None:
+        delay = self._retry_backoff * (2 ** attempt)
+        delay += random.uniform(0.0, self._retry_backoff)
+        if delay > 0.0:
+            time.sleep(delay)
+
+    def _send_sdk_command(self, target_state: int, power: float,
+                          retries: Optional[int] = None,
+                          jitter: bool = True) -> bool:
+        if target_state not in _VALID_GRIPPER_STATES:
+            self.logger.error(
+                f'Refusing invalid gripper target state {target_state}')
+            return False
+
+        if retries is None:
+            retries = self._command_retries
+        retries = max(0, int(retries))
+
+        if jitter and self._command_jitter > 0.0:
+            # Desynchronize a burst when many PCs send a command together.
+            time.sleep(random.uniform(0.0, self._command_jitter))
+
+        power = min(1.0, max(0.0, float(power)))
+        power_percent = max(1, min(100, int(round(100.0 * power))))
+
+        for attempt in range(retries + 1):
+            try:
+                with self._sdk_lock:
+                    if target_state == GripperState.OPEN.value:
+                        ok = bool(self.gripper.open(power=power_percent))
+                    elif target_state == GripperState.CLOSE.value:
+                        ok = bool(self.gripper.close(power=power_percent))
+                    else:
+                        ok = bool(self.gripper.pause())
+            except Exception as exc:
+                ok = False
+                self.logger.warning(
+                    f'Gripper command attempt {attempt + 1} raised: {exc}')
+
+            if ok:
+                return True
+
+            self.logger.warning(
+                f'Gripper command attempt {attempt + 1} failed '
+                f'(target={target_state}, power={power_percent})')
+            if attempt < retries:
+                self._retry_sleep(attempt)
+
+        return False
+
+    # ------------------------------------------------------------------
+    # ROS 2 action server
+    # ------------------------------------------------------------------
+
+    def _finish_result(self, start_monotonic: float
+                       ) -> robomaster_msgs.action.GripperControl.Result:
+        elapsed_ns = max(
+            0, int((time.monotonic() - start_monotonic) * 1_000_000_000))
+        duration = rclpy.duration.Duration(nanoseconds=elapsed_ns)
+        return robomaster_msgs.action.GripperControl.Result(
+            duration=duration.to_msg())
+
+    def _release_goal(self) -> None:
+        with self._goal_mutex:
+            self._active_goal_handle = None
+            self._goal_reserved = False
+            self._cancel_event.clear()
+            self._goal_done_event.set()
+
+    def execute_gripper_callback(
+            self, goal_handle: Any
+            ) -> robomaster_msgs.action.GripperControl.Result:
+        start_monotonic = time.monotonic()
+
+        with self._goal_mutex:
+            # Normally the reservation was made in goal_callback. Keep this
+            # fallback so a lifecycle edge case cannot run two goals at once.
+            if self._active_goal_handle is not None:
+                goal_handle.abort()
+                return self._finish_result(start_monotonic)
+            self._active_goal_handle = goal_handle
+
         try:
-            self.gripper.unsub_status()
-        except AttributeError:
-            pass
+            request = goal_handle.request
+            target_state = int(request.target_state)
+            power = float(request.power)
+
+            self.logger.info(
+                f'Start moving gripper: target={target_state}, power={power:.3f}')
+
+            if target_state not in _VALID_GRIPPER_STATES:
+                self.logger.error(
+                    f'Invalid gripper target state {target_state}')
+                goal_handle.abort()
+                return self._finish_result(start_monotonic)
+
+            if not math.isfinite(power) or power < 0.0 or power > 1.0:
+                self.logger.error(
+                    f'Invalid gripper power {power}; expected [0, 1]')
+                goal_handle.abort()
+                return self._finish_result(start_monotonic)
+
+            if (self._cancel_event.is_set() or
+                    goal_handle.is_cancel_requested):
+                goal_handle.canceled()
+                return self._finish_result(start_monotonic)
+
+            status_ready = self._ensure_status_subscription()
+
+            if (status_ready and not self._status_is_stale() and
+                    self.gripper_state == target_state):
+                goal_handle.succeed()
+                self.logger.info('Gripper is already at the requested state')
+                return self._finish_result(start_monotonic)
+
+            if not status_ready and target_state != GripperState.PAUSED.value:
+                self.logger.warning(
+                    'No gripper status stream is available; command will be '
+                    'sent, but the action cannot be confirmed')
+
+            if not self._send_sdk_command(target_state, power):
+                self.logger.error('RoboMaster SDK rejected/timed out the command')
+                goal_handle.abort()
+                return self._finish_result(start_monotonic)
+
+            # The gripper ROS documentation defines PAUSE as an immediate
+            # action. There is no physical end-position to wait for.
+            if target_state == GripperState.PAUSED.value:
+                self._update_gripper_state(GripperState.PAUSED.value)
+                goal_handle.succeed()
+                self.logger.info('Gripper paused')
+                return self._finish_result(start_monotonic)
+
+            deadline = time.monotonic() + self._action_timeout
+            last_feedback_state: Optional[int] = None
+            resubscribe_attempted = False
+
+            while True:
+                if (self._cancel_event.is_set() or
+                        goal_handle.is_cancel_requested):
+                    self._send_sdk_command(
+                        GripperState.PAUSED.value,
+                        0.0,
+                        retries=0,
+                        jitter=False)
+                    goal_handle.canceled()
+                    self.logger.warning('Gripper action canceled')
+                    return self._finish_result(start_monotonic)
+
+                if self._shutdown_event.is_set():
+                    self._send_sdk_command(
+                        GripperState.PAUSED.value,
+                        0.0,
+                        retries=0,
+                        jitter=False)
+                    goal_handle.abort()
+                    self.logger.warning('Gripper action aborted during shutdown')
+                    return self._finish_result(start_monotonic)
+
+                current_state = self.gripper_state
+
+                if (current_state in _VALID_GRIPPER_STATES and
+                        current_state != last_feedback_state):
+                    feedback = (
+                        robomaster_msgs.action.GripperControl.Feedback())
+                    feedback.current_state = current_state
+                    goal_handle.publish_feedback(feedback)
+                    last_feedback_state = current_state
+
+                if current_state == target_state:
+                    goal_handle.succeed()
+                    self.logger.info(
+                        'Gripper reached target after '
+                        f'{(time.monotonic() - start_monotonic) * 1000.0:.0f} ms')
+                    return self._finish_result(start_monotonic)
+
+                now = time.monotonic()
+                if now >= deadline:
+                    self.logger.error(
+                        f'Gripper did not reach target {target_state} within '
+                        f'{self._action_timeout:.2f} s; current={current_state}')
+                    self._send_sdk_command(
+                        GripperState.PAUSED.value,
+                        0.0,
+                        retries=0,
+                        jitter=False)
+                    goal_handle.abort()
+                    return self._finish_result(start_monotonic)
+
+                # If the persistent stream died during a network disturbance,
+                # restart it once during this goal instead of waiting forever.
+                if (not resubscribe_attempted and self._status_is_stale() and
+                        now - start_monotonic > 0.5):
+                    resubscribe_attempted = True
+                    self.logger.warning(
+                        'No recent gripper status; attempting one resubscribe')
+                    self._ensure_status_subscription()
+
+                with self._state_condition:
+                    remaining = deadline - time.monotonic()
+                    self._state_condition.wait(
+                        timeout=max(0.0, min(0.1, remaining)))
+
+        except Exception as exc:
+            # The action lock/reservation is released in finally even if ROS,
+            # the SDK, or a publisher raises unexpectedly.
+            self.logger.error(f'Unhandled gripper action error: {exc}')
+            self._send_sdk_command(
+                GripperState.PAUSED.value,
+                0.0,
+                retries=0,
+                jitter=False)
+            try:
+                goal_handle.abort()
+            except Exception:
+                pass
+            return self._finish_result(start_monotonic)
+        finally:
+            self._release_goal()
+
+    def new_gripper_goal_callback(
+            self,
+            goal_request: robomaster_msgs.action.GripperControl.Goal
+            ) -> rclpy.action.server.GoalResponse:
+        target_state = int(goal_request.target_state)
+        power = float(goal_request.power)
+
+        if target_state not in _VALID_GRIPPER_STATES:
+            self.logger.warning(
+                f'Rejecting invalid gripper target state {target_state}')
+            return rclpy.action.server.GoalResponse.REJECT
+
+        if not math.isfinite(power) or power < 0.0 or power > 1.0:
+            self.logger.warning(
+                f'Rejecting invalid gripper power {power}')
+            return rclpy.action.server.GoalResponse.REJECT
+
+        with self._goal_mutex:
+            if self._goal_reserved:
+                self.logger.warning(
+                    'Rejecting gripper goal because another goal is active')
+                return rclpy.action.server.GoalResponse.REJECT
+
+            self._goal_reserved = True
+            self._cancel_event.clear()
+            self._goal_done_event.clear()
+
+        return rclpy.action.server.GoalResponse.ACCEPT
+
+    def cancel_gripper_callback(
+            self, goal_handle: Any) -> rclpy.action.CancelResponse:
+        self.logger.info('Canceling gripper action requested')
+
+        with self._goal_mutex:
+            if not self._goal_reserved:
+                return rclpy.action.CancelResponse.REJECT
+            self._cancel_event.set()
+
+        # Do not call the synchronous SDK pause() method from this callback.
+        # The execute callback observes the event and pauses the gripper while
+        # preserving SDK call serialization.
+        with self._state_condition:
+            self._state_condition.notify_all()
+
+        return rclpy.action.CancelResponse.ACCEPT
