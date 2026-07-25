@@ -223,7 +223,6 @@ class Gripper(Module):
 
     def cancel_gripper_callback(self, goal_handle: Any) -> rclpy.action.CancelResponse:
         self.logger.info('Canceling gripper action')
-        time.sleep(5.0)
         self.gripper.pause()
         self.should_abort = True
         return rclpy.action.CancelResponse.ACCEPT
