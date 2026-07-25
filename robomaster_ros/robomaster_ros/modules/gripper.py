@@ -199,7 +199,7 @@ class Gripper(Module):
 
         # Reduced deadline to 3 seconds. The gripper physically operates very fast. 
         # A 7s wait while packets are dropping causes massive latency cascades.
-        deadline = self.clock.now() + rclpy.duration.Duration(seconds=3)
+        deadline = self.clock.now() + rclpy.duration.Duration(seconds=15)
         
         while (current_state != request.target_state and not self.should_abort and
                not goal_handle.is_cancel_requested):
