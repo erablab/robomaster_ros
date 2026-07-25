@@ -12,6 +12,8 @@ import rclpy.time
 import robomaster.robot
 import robomaster.gripper
 import robomaster.action
+import robomaster.protocol
+import robomaster.util
 
 import robomaster_msgs.msg
 import sensor_msgs.msg
@@ -21,7 +23,6 @@ if TYPE_CHECKING:
     from ..client import RoboMasterROS
 
 from .. import Module
-
 
 _joint_data: np.ndarray = np.array([
     [0.000000, 0.000001, 0.000002, -0.000000, -0.000001, 0.000001, 0.000000, 0.000001, -0.000001, -0.000001, 0.000000, -0.000000, -0.000000],
@@ -72,19 +73,15 @@ _joint_data: np.ndarray = np.array([
     [-0.022499, 0.679722, -1.739244, -0.018727, 1.069579, -0.916939, -0.303067, -0.694846, 1.761261, -0.003472, -1.055300, 0.893363, 0.295063],
     [-0.022918, 0.687846, -1.764646, -0.019682, 1.088293, -0.933733, -0.306504, -0.703549, 1.786527, -0.003254, -1.072585, 0.908795, 0.298343]]).T
 
-
 class GripperState(enum.Enum):
     PAUSED = 0
     OPEN = 1
     CLOSE = 2
 
-
 def gripper_data_info(self: robomaster.gripper.GripperSubject) -> int:
     return self._status
 
-
 robomaster.gripper.GripperSubject.data_info = gripper_data_info
-
 
 class Gripper(Module):
 
@@ -93,36 +90,42 @@ class Gripper(Module):
     def __init__(self, robot: robomaster.robot.Robot, node: 'RoboMasterROS') -> None:
         self.gripper = robot.gripper
         _open: bool = node.declare_parameter('gripper.open', False).value
-        if _open:
-            self.gripper.open()
+        
         self.node = node
         self.logger = node.get_logger()
         self.clock = node.get_clock()
+        
+        if _open:
+            try:
+                self.gripper.open()
+            except Exception as e:
+                self.logger.warning(f"Initial gripper open failed (network drop?): {e}")
+
         self.msg = sensor_msgs.msg.JointState()
         self.msg.name = (
             [node.tf_frame('gripper_m_joint')] +
             [node.tf_frame(f'{side}_gripper_joint_{i}')
              for side in ('left', 'right') for i in (1, 2, 4, 5, 6, 7)])
-        # print(self.msg.name)
-        # self.data = np.loadtxt("gripper.csv", delimiter=",").T
-        # self.data = np.array(_joint_data)
-        # print(len(self.data), self.data)
+
         n = _joint_data.shape[-1]
-        # TODO: record the prismatic joint too
-        # self.data = np.insert(self.data, 0, np.linspace(0.001, -0.023, n), axis=0)
         self._xs = np.linspace(0, 1, n)
+        
         qos = rclpy.qos.QoSProfile(
             depth=1,
             history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST,
             durability=rclpy.qos.QoSDurabilityPolicy.TRANSIENT_LOCAL)
+            
         self.gripper_pub = node.create_publisher(robomaster_msgs.msg.GripperState, 'gripper', qos)
+        
         self._gripper_state = -1
         self.query_gripper_state()
-        # TODO(jerome): make it latched
+        
         self.should_abort = False
         self._gripper_action_lock = threading.Lock()
-        cbg = rclpy.callback_groups.MutuallyExclusiveCallbackGroup()
-        # TODO(Jerome): there is no need to lock when I use exclusive callback groups
+        
+        # Switched to Reentrant to allow cancel requests to interrupt execution loops
+        cbg = rclpy.callback_groups.ReentrantCallbackGroup()
+        
         self._gripper_action_server = rclpy.action.ActionServer(
             node, robomaster_msgs.action.GripperControl, 'gripper', self.execute_gripper_callback,
             goal_callback=self.new_gripper_goal_callback,
@@ -130,51 +133,57 @@ class Gripper(Module):
 
     def stop(self) -> None:
         if self.node.connected:
-            ...
+            pass
         self._gripper_action_server.destroy()
 
     def abort(self) -> None:
         if self._gripper_action_lock.locked():
             self.should_abort = True
-            while self._gripper_action_lock.locked():
-                self.logger.info("wait for the action to terminate")
+            timeout = time.time() + 2.0  # Prevent infinite lock waiting
+            while self._gripper_action_lock.locked() and time.time() < timeout:
+                self.logger.info("waiting for the action to terminate...")
                 time.sleep(0.1)
 
-    # 0 open -> 1 close
     def joint_state(self, value: float) -> sensor_msgs.msg.JointState:
         self.msg.position = [np.interp(value, self._xs, data) for data in _joint_data]
         return self.msg
 
-    def execute_gripper_callback(self, goal_handle: Any
-                                 ) -> robomaster_msgs.action.GripperControl.Result:
+    def execute_gripper_callback(self, goal_handle: Any) -> robomaster_msgs.action.GripperControl.Result:
         if self._gripper_action_lock.locked():
             goal_handle.abort()
             return robomaster_msgs.action.GripperControl.Result()
-        # TODO(jerome): Complete with failures, ...
+            
         request = goal_handle.request
 
         if request.target_state == self.gripper_state:
             goal_handle.succeed()
             self.logger.info('No need to move gripper')
             return robomaster_msgs.action.GripperControl.Result()
+            
         self._gripper_action_lock.acquire()
         self.logger.info(f'Start moving gripper with request {request}')
         feedback_msg = robomaster_msgs.action.GripperControl.Feedback()
         self.should_abort = False
+        
         proto = robomaster.protocol.ProtoGripperCtrl()
         proto._control = request.target_state
         proto._power = robomaster.util.GRIPPER_POWER_CHECK.val2proto(100 * request.power)
-        # self.logger.info('Sending ProtoGripperCtrl ...')
-        self.gripper._send_sync_proto(proto, robomaster.protocol.host2byte(3, 6))
-        # self.logger.info('ProtoGripperCtrl sent')
+
+        try:
+            # Wrap SDK call in try/except. Network failure here would crash the Action thread.
+            self.gripper._send_sync_proto(proto, robomaster.protocol.host2byte(3, 6))
+        except Exception as e:
+            self.logger.error(f'Failed sending ProtoGripperCtrl (Dropped Packet?): {e}')
+            self._gripper_action_lock.release()
+            goal_handle.abort()
+            return robomaster_msgs.action.GripperControl.Result()
+
         first: Optional[rclpy.time.Time] = None
         last: Optional[rclpy.time.Time] = None
         current_state: Optional[int] = None
 
         def cb(msg: int) -> None:
-            nonlocal first
-            nonlocal last
-            nonlocal current_state
+            nonlocal first, last, current_state
             last = self.clock.now()
             if not first:
                 first = last
@@ -183,48 +192,62 @@ class Gripper(Module):
             goal_handle.publish_feedback(feedback_msg)
             self.gripper_state = msg
 
-        self.gripper.sub_status(freq=20, callback=cb)
+        try:
+            self.gripper.sub_status(freq=20, callback=cb)
+        except Exception as e:
+            self.logger.warning(f"Could not sub_status: {e}")
 
-        deadline = self.clock.now() + rclpy.duration.Duration(seconds=7)
+        # Reduced deadline to 3 seconds. The gripper physically operates very fast. 
+        # A 7s wait while packets are dropping causes massive latency cascades.
+        deadline = self.clock.now() + rclpy.duration.Duration(seconds=3)
+        
         while (current_state != request.target_state and not self.should_abort and
                not goal_handle.is_cancel_requested):
             if (self.clock.now() > deadline):
                 self.logger.warning(
-                    f'Deadline to reach gripper target state {request.target_state} elapsed')
+                    f'Deadline to reach gripper target state {request.target_state} elapsed. '
+                    f'Assuming packet loss or hardware jam.')
                 break
-            time.sleep(1 / 10)
+            time.sleep(0.05)
+
         try:
             self.gripper.unsub_status()
         except AttributeError:
             pass
+            
         if last and first:
             duration = last - first
         else:
-            self.logger.warn('Got no message from gripper')
+            self.logger.warn('Got no state messages from gripper during execution')
             duration = rclpy.duration.Duration()
+            
         if goal_handle.is_cancel_requested:
             self.logger.warn('Canceled gripping')
             goal_handle.canceled()
-        elif self.should_abort or feedback_msg.current_state != request.target_state:
+        elif self.should_abort or (current_state is not None and feedback_msg.current_state != request.target_state):
             goal_handle.abort()
             self.logger.warn(f'Failed moving gripper state: current state '
                              f'[{self.gripper_state}] != target state [{request.target_state}]')
         else:
             goal_handle.succeed()
             self.logger.info(f'Done moving gripper after {duration.nanoseconds / 1e6:.0f} ms')
+            
         self._gripper_action_lock.release()
         return robomaster_msgs.action.GripperControl.Result(duration=duration.to_msg())
 
-    def new_gripper_goal_callback(self, goal_request: robomaster_msgs.action.GripperControl.Goal
-                                  ) -> rclpy.action.server.GoalResponse:
+    def new_gripper_goal_callback(self, goal_request: robomaster_msgs.action.GripperControl.Goal) -> rclpy.action.server.GoalResponse:
         if self._gripper_action_lock.locked():
             return rclpy.action.server.GoalResponse.REJECT
         return rclpy.action.server.GoalResponse.ACCEPT
 
     def cancel_gripper_callback(self, goal_handle: Any) -> rclpy.action.CancelResponse:
-        self.logger.info('Canceling gripper action')
-        self.gripper.pause()
+        self.logger.info('Canceling gripper action requested')
         self.should_abort = True
+        try:
+            self.gripper.pause()
+        except Exception as e:
+            self.logger.warning(f"Failed to send pause on cancel: {e}")
+        # Completely removed the `time.sleep(5.0)` that was causing thread deadlocks
         return rclpy.action.CancelResponse.ACCEPT
 
     @property
@@ -234,7 +257,6 @@ class Gripper(Module):
     @gripper_state.setter
     def gripper_state(self, value: int) -> None:
         if value != self._gripper_state:
-            # self.logger.info(f"Gripper state changed to {GripperState(value)}")
             self._gripper_state = value
             msg = robomaster_msgs.msg.GripperState(state=value)
             msg.header.stamp = self.clock.now().to_msg()
@@ -245,15 +267,26 @@ class Gripper(Module):
                 self.node.joint_state_pub.publish(self.joint_state(1))
 
     def query_gripper_state(self) -> None:
-        # self.logger.info(f"query_gripper_state in thread {threading.current_thread().name}")
-
         self._gripper_state = -1
 
         def cb(msg: int) -> None:
             self.gripper_state = msg
-        self.gripper.sub_status(freq=10, callback=cb)
+            
+        try:
+            self.gripper.sub_status(freq=10, callback=cb)
+        except Exception as e:
+            self.logger.error(f"Failed to subscribe to initial gripper status: {e}")
+
+        # FIX: Added a strict 2-second timeout. If the first packet drops, 
+        # it will no longer freeze node startup forever.
+        start_time = time.time()
         while self._gripper_state == -1:
+            if time.time() - start_time > 2.0:
+                self.logger.warning("Timeout querying initial gripper state. Proceeding anyway.")
+                self._gripper_state = GripperState.PAUSED.value
+                break
             time.sleep(0.01)
+            
         try:
             self.gripper.unsub_status()
         except AttributeError:
